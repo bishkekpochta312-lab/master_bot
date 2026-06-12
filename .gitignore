@@ -1,0 +1,100 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+pythonenv*
+
+# Virtual Environment
+venv/
+.venv/
+env/
+.env
+.env.local
+.env.*.local
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+masters_stats.db
+notification_queue.db
+orders.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.suo
+*.user
+*.sln
+*.userprefs
+
+# Logs
+logs/
+*.log
+*.log.*
+
+# OS generated files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Telegram Bot
+*.token
+config.ini
+
+# Secrets and Keys
+*.pem
+*.key
+*.crt
+.secrets/
+
+# Backup files
+*.bak
+*.backup
+*.old
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Project specific
+*.lock
+*.pid
+*.pid.lock
+*.spec
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Uploads
+uploads/
+downloads/
+temp/
+tmp/
+
+# Environment variables
+.env
+.env.production
+.env.development
+
+# Logs from bot
+bot.log
+error.log
+debug.log
