@@ -28,11 +28,16 @@ DB_NAME = "masters_stats.db"
 # Создаём блокировку для базы данных
 db_lock = threading.Lock()
 
+# Хранилище активных заказов и уведомлений
+active_orders = {}
+pending_notifications = {}
+
 # Состояния для админских команд
 class AdminStates(StatesGroup):
     waiting_for_master_id_for_commission = State()
     waiting_for_commission = State()
 
+# ========== ФУНКЦИИ БАЗЫ ДАННЫХ ==========
 def init_db():
     """Инициализация базы данных с блокировкой"""
     with db_lock:
@@ -78,7 +83,7 @@ def init_db():
                 conn.execute("ALTER TABLE masters ADD COLUMN last_active TIMESTAMP")
                 print("✅ Добавлена колонка last_active")
             except sqlite3.OperationalError:
-                pass  # колонка уже существует
+                pass
             
             try:
                 conn.execute("ALTER TABLE masters ADD COLUMN rating REAL DEFAULT 0")
@@ -92,13 +97,27 @@ def init_db():
             except sqlite3.OperationalError:
                 pass
             
-            # Обновляем существующие записи (ставим дату по умолчанию)
+            # Обновляем существующие записи
             conn.execute("""
                 UPDATE masters SET last_active = CURRENT_TIMESTAMP 
                 WHERE last_active IS NULL
             """)
                 
     print("✅ База данных готова")
+
+def get_top_masters(limit=2):
+    """Возвращает топ N мастеров по рейтингу (топ-2)"""
+    with db_lock:
+        with sqlite3.connect(DB_NAME, timeout=10) as conn:
+            cur = conn.execute("""
+                SELECT user_id, username, full_name, orders_taken, total_commission, rating 
+                FROM masters 
+                WHERE orders_taken > 0 
+                ORDER BY rating DESC 
+                LIMIT ?
+            """, (limit,))
+            return cur.fetchall()
+
 def update_rating(user_id):
     """Обновляет рейтинг мастера с блокировкой"""
     with db_lock:
@@ -154,7 +173,6 @@ def increment_orders(user_id, commission=0):
     """Увеличивает счётчик заказов с блокировкой"""
     with db_lock:
         with sqlite3.connect(DB_NAME, timeout=10) as conn:
-            # Сначала увеличиваем количество заказов
             conn.execute("""
                 UPDATE masters 
                 SET orders_taken = orders_taken + 1, 
@@ -162,7 +180,6 @@ def increment_orders(user_id, commission=0):
                 WHERE user_id = ?
             """, (user_id,))
             
-            # Если есть комиссия, добавляем её отдельно
             if commission > 0:
                 conn.execute("""
                     UPDATE masters 
@@ -170,10 +187,45 @@ def increment_orders(user_id, commission=0):
                     WHERE user_id = ?
                 """, (commission, user_id))
     
-    # Обновляем рейтинг
     update_rating(user_id)
-# Хранилище активных заказов
-active_orders = {}
+
+# ========== ФУНКЦИИ ДЛЯ РАБОТЫ С ЗАКАЗАМИ ==========
+async def send_notification_to_master(master_id, order_text, contacts, order_id):
+    """Отправляет уведомление конкретному мастеру"""
+    try:
+        message = format_master_notification(order_text, contacts)
+        await bot.send_message(master_id, message, parse_mode="Markdown")
+        
+        with db_lock:
+            with sqlite3.connect(DB_NAME, timeout=10) as conn:
+                conn.execute("""
+                    INSERT INTO notification_queue (order_id, master_id, sent, sent_at)
+                    VALUES (?, ?, 1, ?)
+                """, (order_id, master_id, datetime.now()))
+        
+        return True
+    except Exception as e:
+        print(f"Не удалось отправить уведомление мастеру {master_id}: {e}")
+        return False
+
+async def send_delayed_notifications(order_id, excluded_masters, order_text, contacts):
+    """Отправляет уведомления всем мастерам через 1 минуту (кроме топ-2)"""
+    await asyncio.sleep(60)  # 1 минута
+    
+    if order_id not in active_orders or active_orders[order_id]["taken"]:
+        return
+    
+    with db_lock:
+        with sqlite3.connect(DB_NAME, timeout=10) as conn:
+            cur = conn.execute("SELECT user_id FROM masters")
+            all_masters = cur.fetchall()
+    
+    for (master_id,) in all_masters:
+        if master_id not in excluded_masters:
+            await send_notification_to_master(master_id, order_text, contacts, order_id)
+    
+    if order_id in pending_notifications:
+        del pending_notifications[order_id]
 
 def extract_contacts(text):
     contacts = {
@@ -245,6 +297,28 @@ def format_master_message(order_text, contacts):
     
     return message
 
+def format_master_notification(order_text, contacts):
+    """Форматирует сообщение для уведомления мастера о новом заказе"""
+    message = "🔔 **НОВЫЙ ЗАКАЗ ДОСТУПЕН!**\n\n"
+    message += "📋 **ДЕТАЛИ ЗАКАЗА:**\n"
+    message += "─" * 20 + "\n"
+    message += f"{order_text}\n\n"
+    
+    message += "📞 **КОНТАКТЫ КЛИЕНТА:**\n"
+    message += "─" * 20 + "\n"
+    
+    if contacts["name"]:
+        message += f"👤 *Имя:* {contacts['name']}\n"
+    if contacts["phone"]:
+        message += f"📱 *Телефон:* `{contacts['phone']}`\n"
+    if contacts["address"]:
+        message += f"📍 *Адрес:* {contacts['address']}\n"
+    
+    message += "\n" + "─" * 20 + "\n"
+    message += "👉 *Перейдите в группу и нажмите «ВЗЯТЬ ЗАКАЗ»!*"
+    
+    return message
+
 # ========== КОМАНДЫ ==========
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -258,8 +332,8 @@ async def cmd_start(message: types.Message):
         "• Только мастер, взявший заказ, получает телефон в ЛС\n\n"
         "🏆 **Система рейтинга:**\n"
         "• Рейтинг = Общая комиссия / Количество заказов\n"
-        "• Топ-3 мастера получают заказы МГНОВЕННО\n"
-        "• Остальные мастера — через 2 минуты\n\n"
+        "• 🥇🥈 *Топ-2 мастера* получают заказы МГНОВЕННО\n"  # ⬅️ ИСПРАВЛЕНО
+        "• 👤 Остальные мастера — через 1 минуту\n\n"  # ⬅️ ИСПРАВЛЕНО
         "📌 **Команды:**\n"
         "• `/my_rating` — узнать свой рейтинг\n"
         "• `/top` — топ-10 мастеров\n\n"
@@ -295,6 +369,7 @@ async def cmd_my_rating(message: types.Message):
         await message.answer(
             "📊 **У вас пока нет рейтинга**\n\n"
             "Выполните первый заказ, чтобы появился рейтинг!\n\n"
+            "🏆 Топ-2 мастера получают заказы мгновенно!\n"  # ⬅️ ИСПРАВЛЕНО
             "Команда `/top` — посмотреть топ мастеров",
             parse_mode="Markdown"
         )
@@ -316,6 +391,11 @@ async def cmd_my_rating(message: types.Message):
     
     if my_position:
         text += f"📊 *Место:* `{my_position}` из `{len(all_masters)}`\n"
+        
+        if my_position <= 2:
+            text += "\n🎉 *Вы в топ-2!* Получаете заказы мгновенно!\n"
+        else:
+            text += "\n⏰ Заказы приходят через 1 минуту\n"
     
     await message.answer(text, parse_mode="Markdown")
 
@@ -349,7 +429,6 @@ async def cmd_top(message: types.Message):
 # ========== АДМИН-КОМАНДЫ ==========
 @dp.message(Command("add_commission"))
 async def cmd_add_commission(message: types.Message, state: FSMContext):
-    """Добавить комиссию мастеру (только админ)"""
     if message.from_user.id not in ADMIN_IDS:
         await message.answer("⛔ Только для администраторов!")
         return
@@ -382,17 +461,14 @@ async def process_master_id_for_commission(message: types.Message, state: FSMCon
 
 @dp.message(AdminStates.waiting_for_commission)
 async def process_commission_amount(message: types.Message, state: FSMContext):
-    # Очищаем текст от пробелов и лишних символов
     text = message.text.strip()
-    
-    # Убираем пробелы внутри числа
     text = text.replace(" ", "").replace(",", ".").replace("сом", "").strip()
     
     try:
         commission = float(text)
         
         if commission <= 0:
-            await message.answer("❌ Сумма должна быть больше 0! Введите число (например: 500)")
+            await message.answer("❌ Сумма должна быть больше 0!")
             return
         
         data = await state.get_data()
@@ -416,15 +492,7 @@ async def process_commission_amount(message: types.Message, state: FSMContext):
         await state.clear()
         
     except ValueError:
-        await message.answer(
-            "❌ Неверный формат!\n\n"
-            "📝 Примеры правильного ввода:\n"
-            "• `500`\n"
-            "• `2000`\n"
-            "• `1500.50`\n\n"
-            "Попробуйте еще раз:",
-            parse_mode="Markdown"
-        )
+        await message.answer("❌ Неверный формат! Введите число (например: 500)")
 
 @dp.message(Command("stats"))
 async def cmd_stats(message: types.Message):
@@ -513,22 +581,43 @@ async def handle_order(message: types.Message):
     new_msg = await message.answer(public_text, reply_markup=keyboard, parse_mode="Markdown")
     await message.delete()
     
+    # Получаем топ-2 мастеров
+    top_masters = get_top_masters(2)
+    top_master_ids = [m[0] for m in top_masters]
+    
     active_orders[new_msg.message_id] = {
         "chat_id": message.chat.id,
         "full_text": message.text,
         "contacts": contacts,
-        "taken": False
+        "taken": False,
+        "top_masters": top_master_ids
     }
+    
+    # Отправляем уведомления топ-2 мастерам
+    for master in top_masters:
+        master_id, username, full_name, _, _, _ = master
+        await send_notification_to_master(master_id, message.text, contacts, new_msg.message_id)
+    
+    # Запускаем отложенную рассылку для остальных (через 1 минуту)
+    if len(top_master_ids) < len(get_all_masters()):
+        task = asyncio.create_task(
+            send_delayed_notifications(new_msg.message_id, top_master_ids, message.text, contacts)
+        )
+        pending_notifications[new_msg.message_id] = task
+    
+    # Уведомление админу
+    await bot.send_message(
+        message.from_user.id,
+        f"✅ Заказ опубликован!\n\n"
+        f"🔔 Уведомления отправлены топ-{len(top_masters)} мастерам\n"
+        f"⏰ Остальным мастерам придет через 1 минуту\n"  # ⬅️ ИСПРАВЛЕНО
+    )
 
 @dp.callback_query(F.data == "take_order")
 async def take_order(callback: types.CallbackQuery):
     user = callback.from_user
     msg_id = callback.message.message_id
     
-    print(f"🔍 Мастер {user.id} пытается взять заказ {msg_id}")
-    print(f"📋 Активные заказы: {list(active_orders.keys())}")
-    
-    # Проверяем, существует ли заказ
     if msg_id not in active_orders:
         await callback.answer("❌ Этот заказ уже кто-то взял!", show_alert=True)
         return
@@ -538,66 +627,46 @@ async def take_order(callback: types.CallbackQuery):
         await callback.answer("❌ Заказ уже взят!", show_alert=True)
         return
     
-    # Отмечаем заказ как взятый
     order_data["taken"] = True
     
-    # Регистрируем мастера
+    # Отменяем отложенную рассылку
+    if msg_id in pending_notifications:
+        pending_notifications[msg_id].cancel()
+        del pending_notifications[msg_id]
+    
     get_or_create_master(user.id, user.username, user.full_name or user.first_name)
     
     try:
-        # Отправляем мастеру контакты
         master_message = format_master_message(order_data["full_text"], order_data["contacts"])
         await bot.send_message(user.id, master_message, parse_mode="Markdown")
         
-        # Увеличиваем счётчик заказов
-        with db_lock:
-            with sqlite3.connect(DB_NAME, timeout=10) as conn:
-                conn.execute("""
-                    UPDATE masters 
-                    SET orders_taken = orders_taken + 1, 
-                        last_active = CURRENT_TIMESTAMP
-                    WHERE user_id = ?
-                """, (user.id,))
-                
-                # Получаем новое количество для проверки
-                cur = conn.execute("SELECT orders_taken FROM masters WHERE user_id = ?", (user.id,))
-                result = cur.fetchone()
-                print(f"✅ Мастер {user.id} теперь имеет {result[0]} заказов")
+        increment_orders(user.id, 0)
         
-        # Обновляем рейтинг
-        update_rating(user.id)
-        
-        # ⚠️ ВАЖНО: Удаляем сообщение с заказом из группы
-        # Вместо await callback.message.delete() используйте:
+        # Удаляем сообщение из группы
         try:
             await bot.delete_message(
                 chat_id=callback.message.chat.id,
                 message_id=callback.message.message_id
             )
-            print(f"✅ Сообщение {callback.message.message_id} удалено через bot.delete_message")
         except Exception as e:
             print(f"❌ Не удалось удалить: {e}")
         
-        # Удаляем заказ из активных
         del active_orders[msg_id]
         
-        # Подтверждение мастеру
         await callback.answer("✅ Вы взяли заказ! Контакты в ЛС.", show_alert=True)
         
-        # Отправляем уведомление в группу
         await bot.send_message(
             callback.message.chat.id, 
             f"✅ Заказ взят мастером @{user.username if user.username else user.first_name}"
         )
         
     except Exception as e:
-        print(f"❌ Ошибка в take_order: {e}")
         if "can't initiate conversation" in str(e):
             await callback.answer("❌ Напишите боту /start в ЛС!", show_alert=True)
-            # Возвращаем заказ обратно, так как мастер не получил контакты
             order_data["taken"] = False
         else:
             await callback.answer(f"❌ Ошибка: {str(e)[:50]}", show_alert=True)
+
 # ========== ЗАПУСК ==========
 async def main():
     init_db()
@@ -606,6 +675,10 @@ async def main():
     print(f"🤖 Бот @{bot_info.username} запущен!")
     print(f"👑 Админы: {ADMIN_IDS}")
     print("="*50)
+    print("\n🏆 НАСТРОЙКИ РЕЙТИНГА:")
+    print("   • Топ-2 мастера — уведомления МГНОВЕННО")
+    print("   • Остальные мастера — через 1 МИНУТУ")
+    print("="*50)
     print("\n✅ Доступные команды:")
     print("   /add_commission - добавить комиссию мастеру")
     print("   /stats - статистика")
@@ -613,9 +686,6 @@ async def main():
     print("   /top - топ мастеров")
     print("="*50)
     await dp.start_polling(bot)
-
-
-
 
 if __name__ == "__main__":
     asyncio.run(main())
